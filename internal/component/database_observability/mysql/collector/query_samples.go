@@ -191,7 +191,7 @@ func (c *QuerySamples) Stop() {
 
 func (c *QuerySamples) runSetupConsumersCheck() {
 	defer c.wg.Done()
-	
+
 	ticker := time.NewTicker(c.setupConsumersCheckInterval)
 	defer ticker.Stop()
 
