@@ -152,10 +152,7 @@ func (c *QuerySamples) Start(ctx context.Context) error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		defer func() {
-			c.Stop()
-			c.running.Store(false)
-		}()
+		defer c.running.Store(false)
 
 		ticker := time.NewTicker(c.collectInterval)
 		defer ticker.Stop()
