@@ -194,14 +194,14 @@ func TestQuerySamples_FetchQuerySamples(t *testing.T) {
 			lokiClient := loki.NewCollectingHandler()
 			defer lokiClient.Stop()
 
-		sampleCollector, err := NewQuerySamples(QuerySamplesArguments{
-			DB:                    db,
-			CollectInterval:       50 * time.Millisecond,
-			EntryHandler:          lokiClient,
-			Logger:                log.NewLogfmtLogger(log.NewSyncWriter(&logBuffer)),
-			DisableQueryRedaction: tc.disableQueryRedaction,
-			ExcludeCurrentUser:    true,
-		})
+			sampleCollector, err := NewQuerySamples(QuerySamplesArguments{
+				DB:                    db,
+				CollectInterval:       50 * time.Millisecond,
+				EntryHandler:          lokiClient,
+				Logger:                log.NewLogfmtLogger(log.NewSyncWriter(&logBuffer)),
+				DisableQueryRedaction: tc.disableQueryRedaction,
+				ExcludeCurrentUser:    true,
+			})
 			require.NoError(t, err)
 			require.NotNil(t, sampleCollector)
 
