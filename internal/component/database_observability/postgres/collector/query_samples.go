@@ -26,10 +26,11 @@ const (
 
 const (
 	queryTextClause     = ", s.query"
+	waitEventTypeLock   = "Lock"
 	stateActive         = "active"
 	stateIdle           = "idle"
-	stateIdleTxnAborted = "idle in transaction (aborted)"
 	stateIdleTxn        = "idle in transaction"
+	stateIdleTxnAborted = "idle in transaction (aborted)"
 )
 
 const selectPgStatActivity = `
@@ -51,7 +52,6 @@ const selectPgStatActivity = `
 		s.state_change,
 		s.wait_event_type,
 		s.wait_event,
-		pg_blocking_pids(s.pid) as blocked_by_pids,
 		s.query_start,
 		s.query_id
 		%s
@@ -67,6 +67,12 @@ const selectPgStatActivity = `
 			)
 		)
 		%s
+`
+
+const selectBlockingPIDs = `
+    SELECT pid, pg_blocking_pids(pid) 
+    FROM pg_stat_activity 
+    WHERE wait_event_type = 'Lock' AND pid != pg_backend_pid()
 `
 
 const excludeCurrentUserClause = `AND s.usesysid != (select oid from pg_roles where rolname = current_user)`
@@ -320,7 +326,8 @@ func (c *QuerySamples) fetchQuerySample(ctx context.Context) (hasActive bool, er
 
 	defer rows.Close()
 
-	activeKeys := map[SampleKey]struct{}{}
+	var buffered []QuerySamplesInfo
+	hasLockWait := false
 
 	for rows.Next() {
 		sample, scanErr := c.scanRow(rows)
@@ -328,7 +335,47 @@ func (c *QuerySamples) fetchQuerySample(ctx context.Context) (hasActive bool, er
 			level.Error(c.logger).Log("msg", "failed to scan pg_stat_activity", "err", scanErr)
 			continue
 		}
+		if sample.WaitEventType.Valid && sample.WaitEventType.String == waitEventTypeLock {
+			hasLockWait = true
+		}
+		buffered = append(buffered, sample)
+	}
 
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("failed to iterate pg_stat_activity rows: %w", err)
+	}
+
+	// Enrich blocked_by_pids only when there are lock waits
+	blockedByPID := map[int]pq.Int64Array{}
+	if hasLockWait {
+		blockedRows, err := c.dbConnection.QueryContext(ctx, selectBlockingPIDs)
+		if err != nil {
+			level.Error(c.logger).Log("msg", "failed to query blocking pids", "err", err)
+		} else {
+			defer blockedRows.Close()
+			for blockedRows.Next() {
+				var pid int
+				var blocked pq.Int64Array
+				if err := blockedRows.Scan(&pid, &blocked); err != nil {
+					level.Error(c.logger).Log("msg", "failed to scan blocking pids row", "err", err)
+					continue
+				}
+				blockedByPID[pid] = blocked
+			}
+			if err := blockedRows.Err(); err != nil {
+				level.Error(c.logger).Log("msg", "failed to iterate blocking pids rows", "err", err)
+			}
+		}
+	}
+
+	activeKeys := map[SampleKey]struct{}{}
+
+	for _, sample := range buffered {
+		if sample.WaitEventType.Valid && sample.WaitEventType.String == waitEventTypeLock {
+			if blocked, ok := blockedByPID[sample.PID]; ok {
+				sample.BlockedByPIDs = blocked
+			}
+		}
 		key, procErr := c.processRow(sample)
 		if procErr != nil {
 			level.Debug(c.logger).Log("msg", "invalid pg_stat_activity set", "queryid", sample.QueryID.Int64, "err", procErr)
@@ -356,11 +403,6 @@ func (c *QuerySamples) fetchQuerySample(ctx context.Context) (hasActive bool, er
 		c.upsertActiveSample(key, sample)
 		activeKeys[key] = struct{}{}
 		continue
-	}
-
-	if err := rows.Err(); err != nil {
-		level.Error(c.logger).Log("msg", "failed to iterate pg_stat_activity rows", "err", err)
-		return false, err
 	}
 
 	// finalize samples that are no longer active or have EndAt set (idle finalized or one off idle sample)
@@ -393,7 +435,6 @@ func (c *QuerySamples) scanRow(rows *sql.Rows) (QuerySamplesInfo, error) {
 		&sample.StateChange,
 		&sample.WaitEventType,
 		&sample.WaitEvent,
-		&sample.BlockedByPIDs,
 		&sample.QueryStart,
 		&sample.QueryID,
 	}
