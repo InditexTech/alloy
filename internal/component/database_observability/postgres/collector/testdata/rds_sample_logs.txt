@@ -1,0 +1,76 @@
+# Sample PostgreSQL stderr logs in RDS format
+# Format: %m|%u|%d|%r|%p|%l|%e|%s|%v|%x|%c|%i|%P|%a|%Q|MESSAGE
+# PostgreSQL 14+ with compute_query_id = on
+
+# 1. Statement Timeout (57014) - Common in long-running queries
+2025-01-12 10:30:45.123 UTC|app-user|books_store|10.0.1.5:54321|9112|4|57014|2025-01-12 10:29:15 UTC|25/112|0|693c34cb.2398|SELECT|0|psql|5457019535816659310|ERROR:  canceling statement due to statement timeout
+STATEMENT:  SELECT pg_sleep(5);
+
+# 2. Deadlock Detected (40P01) - Critical transaction issue
+2025-01-12 10:31:23.258 UTC|app-user|books_store|10.0.1.5:54321|9185|9|40P01|2025-01-12 10:29:19 UTC|36/148|837|693c34cf.23e1|UPDATE|0|webapp|3188095831510673590|ERROR:  deadlock detected
+DETAIL:  Process 9185 waits for ShareLock on transaction 836; blocked by process 9184.
+Process 9184 waits for ShareLock on transaction 837; blocked by process 9185.
+Process 9185: UPDATE books SET stock = stock - 1 WHERE id = 2;
+Process 9184: UPDATE books SET stock = stock - 1 WHERE id = 1;
+HINT:  See server log for query details.
+CONTEXT:  while locking tuple (3,88) in relation "books"
+STATEMENT:  UPDATE books SET stock = stock - 1 WHERE id = 2;
+
+# 3. Too Many Connections (53300) - Resource exhaustion
+2025-01-12 10:32:31.529 UTC|conn_limited|books_store|10.0.1.10:45678|9449|4|53300|2025-01-12 10:32:31 UTC|91/57|0|693c34db.24e9|startup|0|api_worker|6883023751393440299|FATAL:  too many connections for role "conn_limited"
+
+# 4. Authentication Failure (28P01) - Security concern
+2025-01-12 10:33:42.201 UTC|app-user|books_store|10.0.1.20:52860|9589|2|28P01|2025-01-12 10:33:42 UTC|159/363|0|693c34e6.2575|authentication|0|jdbc_client|225649433808025698|FATAL:  password authentication failed for user "app-user"
+DETAIL:  Connection matched pg_hba.conf line 4: "host all all 10.0.0.0/8 md5"
+
+# 5. Unique Violation (23505) - Data integrity issue
+2025-01-12 10:34:15.891 UTC|web-user|orders_db|10.0.1.5:54322|10123|7|23505|2025-01-12 10:30:00 UTC|42/201|1045|693c3500.2790|INSERT|0|web_app|8123456789012345678|ERROR:  duplicate key value violates unique constraint "orders_pkey"
+DETAIL:  Key (order_id)=(12345) already exists.
+STATEMENT:  INSERT INTO orders (order_id, customer_id, total) VALUES (12345, 67890, 99.99);
+
+# 6. Foreign Key Violation (23503) - Referential integrity
+2025-01-12 10:35:22.456 UTC|api-user|products_db|10.0.1.8:43210|10456|5|23503|2025-01-12 10:35:00 UTC|55/89|1123|693c3512.28d8|INSERT|0|rest_api|9876543210987654321|ERROR:  insert or update on table "order_items" violates foreign key constraint "order_items_product_id_fkey"
+DETAIL:  Key (product_id)=(999999) is not present in table "products".
+STATEMENT:  INSERT INTO order_items (order_id, product_id, quantity) VALUES (100, 999999, 2);
+
+# 7. Division By Zero (22012) - Data exception
+2025-01-12 10:36:10.789 UTC|analytics-user|reports_db|10.0.1.15:54323|11234|3|22012|2025-01-12 10:35:45 UTC|67/145|0|693c3520.2be2|SELECT|0|analytics_tool|1234567890123456789|ERROR:  division by zero
+STATEMENT:  SELECT revenue / quantity FROM sales WHERE quantity = 0;
+
+# 8. Query Canceled (57014) - User interruption
+2025-01-12 10:37:05.234 UTC|batch-user|etl_db|10.0.1.25:54324|11567|12|57014|2025-01-12 10:30:00 UTC|78/234|1567|693c3530.2d2f|SELECT|0|etl_processor|5555555555555555555|ERROR:  canceling statement due to user request
+
+# 9. Connection Does Not Exist (08003) - Network/connection issue
+2025-01-12 10:38:20.567 UTC|monitor-user|monitoring_db|10.0.1.30:54325|11890|2|08003|2025-01-12 10:38:20 UTC|90/12|0|693c3540.2e72|idle|0|monitoring_agent|7777777777777777777|FATAL:  connection to client lost
+
+# 10. Lock Not Available (55P03) - Locking issue
+2025-01-12 10:39:15.890 UTC|maint-user|maintenance_db|10.0.1.35:54326|12123|6|55P03|2025-01-12 10:35:00 UTC|101/456|1678|693c3550.2f5b|ALTER TABLE|0|maintenance_script|8888888888888888888|ERROR:  could not obtain lock on relation "large_table"
+
+# 11. Out of Memory (53200) - Resource issue
+2025-01-12 10:40:30.123 UTC|heavy-user|warehouse_db|10.0.1.40:54327|12456|8|53200|2025-01-12 10:38:00 UTC|112/567|1890|693c3560.30a8|SELECT|0|warehouse_query|9999999999999999999|ERROR:  out of memory
+DETAIL:  Failed on request of size 1073741824.
+STATEMENT:  SELECT * FROM massive_table ORDER BY column1, column2, column3;
+
+# 12. Syntax Error (42601) - SQL error
+2025-01-12 10:41:45.456 UTC|dev-user|dev_db|10.0.1.45:54328|12789|3|42601|2025-01-12 10:41:30 UTC|123/678|0|693c3570.31f5|SELECT|0|psql|1111111111111111111|ERROR:  syntax error at or near "FORM"
+DETAIL:  Unexpected token: FORM
+STATEMENT:  SELECT * FORM users WHERE id = 1;
+
+# 13. Undefined Table (42P01) - Schema issue
+2025-01-12 10:42:50.789 UTC|app-user|app_db|10.0.1.50:54329|13012|4|42P01|2025-01-12 10:40:00 UTC|134/789|2001|693c3580.32d4|SELECT|0|app_server|2222222222222222222|ERROR:  relation "non_existent_table" does not exist
+STATEMENT:  SELECT * FROM non_existent_table WHERE status = 'active';
+
+# 14. Idle Session Timeout (57P05) - Session management
+2025-01-12 10:43:55.012 UTC|idle-user|session_db|10.0.1.55:54330|13345|10|57P05|2025-01-12 10:30:00 UTC|145/890|0|693c3590.3413|idle in transaction|0|idle_client|3333333333333333333|FATAL:  terminating connection due to idle-in-transaction timeout
+
+# 15. Transaction Timeout (25P04) - PostgreSQL 17+ feature
+2025-01-12 10:44:58.345 UTC|long-tx-user|transaction_db|10.0.1.60:54331|13678|15|25P04|2025-01-12 10:20:00 UTC|156/901|2345|693c35a0.3576|UPDATE|0|long_runner|4444444444444444444|ERROR:  terminating connection due to transaction timeout
+
+# 16. Logs without SQLSTATE (should be ignored)
+2025-01-12 10:45:00.000 UTC|app-user|books_store|10.0.1.5:54321|9112|5||2025-01-12 10:29:15 UTC|25/112|0|693c34cb.2398|idle|0|psql|0|LOG:  connection received: host=10.0.1.5 port=54321
+2025-01-12 10:45:01.000 UTC|app-user|books_store|10.0.1.5:54321|9112|6||2025-01-12 10:29:15 UTC|25/112|0|693c34cb.2398|idle|0|psql|0|LOG:  connection authorized: user=app-user database=books_store
+
+# 17. Non-error severities (should be ignored)
+2025-01-12 10:45:02.000 UTC|app-user|books_store|10.0.1.5:54321|9112|7|00000|2025-01-12 10:29:15 UTC|25/112|0|693c34cb.2398|SELECT|5457019535816659310|psql|0|INFO:  some informational message
+2025-01-12 10:45:03.000 UTC|app-user|books_store|10.0.1.5:54321|9112|8|00000|2025-01-12 10:29:15 UTC|25/112|0|693c34cb.2398|SELECT|5457019535816659310|psql|0|WARNING:  some warning message
+
