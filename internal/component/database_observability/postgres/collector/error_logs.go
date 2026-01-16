@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,67 +27,33 @@ var supportedSeverities = map[string]bool{
 	"PANIC": true,
 }
 
-// PostgreSQL Text Log Format (stderr)
-// Expected log_line_prefix: %m|%u|%d|%r|%p|%l|%e|%s|%v|%x|%c|%i|%P|%a|%Q|
-// This produces 15 pipe-delimited fields followed by the log message.
+// PostgreSQL Text Log Format (stderr) - RDS Format
+//
+// RDS log_line_prefix format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
+//
+// Example log line:
+// 2025-01-12 10:30:45 UTC:10.0.1.5:54321:app-user@books_store:[9112]:4:57014:2025-01-12 10:29:15 UTC:25/112:0:693c34cb.2398::psqlERROR:  canceling statement
 //
 // Field mapping:
-// 1. %m - Timestamp with milliseconds
-// 2. %u - User name
-// 3. %d - Database name
-// 4. %r - Remote host:port
-// 5. %p - Process ID
-// 6. %l - Session line number
-// 7. %e - SQLSTATE error code
-// 8. %s - Session start timestamp
-// 9. %v - Virtual transaction ID
-// 10. %x - Transaction ID
-// 11. %c - Session ID
-// 12. %i - Command tag (ps)
-// 13. %P - Parallel leader PID
-// 14. %a - Application name
-// 15. %Q - Query ID (requires PostgreSQL 14+, compute_query_id = on)
-// 16. Log message (severity: message text)
+// %m  - Timestamp with milliseconds (e.g., "2025-01-12 10:30:45 UTC")
+// %r  - Remote host:port (e.g., "10.0.1.5:54321" or "[local]")
+// %u@%d - User@Database (e.g., "app-user@books_store")
+// [%p] - Process ID in brackets (e.g., "[9112]")
+// %l  - Session line number
+// %e  - SQLSTATE error code
+// %s  - Session start timestamp
+// %v  - Virtual transaction ID
+// %x  - Transaction ID
+// %c  - Session ID
+// %q  - Query text (usually empty)
+// %a  - Application name
+// Message - Log message (severity: message text)
 
-// ParsedError contains the extracted error information.
-// Phase 1: Only fields needed for metrics are populated.
-// Phase 2 (future): All fields will be populated for full Loki log emission.
+// ParsedError contains the extracted error information for metrics.
 type ParsedError struct {
-	// Phase 1 fields (used for metrics)
 	ErrorSeverity string // ERROR, FATAL, PANIC
-	SQLState      string // SQLSTATE code (e.g., "57014")
-	ErrorName     string // Human-readable error name (e.g., "query_canceled")
-	SQLStateClass string // First 2 chars of SQLSTATE (e.g., "57")
-	ErrorCategory string // Error category (e.g., "Operator Intervention")
 	User          string // Database user
 	DatabaseName  string // Database name
-	QueryID       int64  // Query ID (from %Q, requires PG 14+)
-
-	// Phase 2 fields (deferred - not yet populated in Phase 1)
-	Timestamp        time.Time
-	PID              int32
-	SessionID        string
-	LineNum          int32
-	RemoteHost       string
-	RemotePort       int32
-	ApplicationName  string
-	BackendType      string
-	PS               string
-	SessionStart     time.Time
-	VXID             string
-	TXID             string
-	Message          string
-	Detail           string
-	Hint             string
-	Context          string
-	Statement        string
-	CursorPosition   int32
-	InternalQuery    string
-	InternalPosition int32
-	FuncName         string
-	FileName         string
-	FileLineNum      int32
-	LeaderPID        int32
 }
 
 type ErrorLogsArguments struct {
@@ -142,10 +106,10 @@ func NewErrorLogs(args ErrorLogsArguments) (*ErrorLogs, error) {
 func (c *ErrorLogs) initMetrics() {
 	c.errorsBySQLState = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "postgres_errors_by_sqlstate_query_user_total",
-			Help: "PostgreSQL errors by SQLSTATE code with database, user, queryid, and instance tracking",
+			Name: "postgres_errors_total",
+			Help: "PostgreSQL errors by severity with database, user, and instance tracking",
 		},
-		[]string{"sqlstate", "error_name", "sqlstate_class", "error_category", "severity", "database", "user", "queryid", "instance", "server_id"},
+		[]string{"severity", "database", "user", "instance", "server_id"},
 	)
 
 	c.parseErrors = prometheus.NewCounter(
@@ -215,12 +179,11 @@ func (c *ErrorLogs) run() {
 }
 
 func (c *ErrorLogs) processLogLine(entry loki.Entry) error {
-	// Phase 1: Parse text format for metrics only
 	return c.parseTextLog(entry)
 }
 
-// parseTextLog extracts fields from stderr text format logs for Phase 1 metrics.
-// Expected format: %m|%u|%d|%r|%p|%l|%e|%s|%v|%x|%c|%i|%P|%a|%Q|SEVERITY:  message
+// parseTextLog extracts fields from stderr text format logs for metrics.
+// Parses RDS format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
 func (c *ErrorLogs) parseTextLog(entry loki.Entry) error {
 	line := entry.Entry.Line
 
@@ -239,60 +202,74 @@ func (c *ErrorLogs) parseTextLog(entry loki.Entry) error {
 	// Check if this is a continuation line (DETAIL, HINT, CONTEXT, STATEMENT, etc.)
 	// These are expected in multi-line errors and should not be counted as parse failures
 	if isContinuationLine(line) {
-		return nil // Skip continuation lines silently in Phase 1
+		return nil // Skip continuation lines silently
 	}
 
-	// Split into 16 parts: 15 prefix fields + message
-	parts := strings.SplitN(line, "|", 16)
-	if len(parts) < 16 {
+	// Parse RDS format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
+	// Example: 2025-01-12 10:30:45 UTC:10.0.1.5:54321:app-user@books_store:[9112]:4:57014:...ERROR:  message
+
+	// Find the user@database part by looking for the pattern before :[
+	// This helps us locate the boundary since [%p] is distinctive
+	pidBracketIdx := strings.Index(line, ":[")
+	if pidBracketIdx == -1 {
 		c.parseErrors.Inc()
-		return fmt.Errorf("invalid log line format: expected 16 pipe-delimited fields, got %d", len(parts))
+		return fmt.Errorf("invalid RDS log format: missing :[pid] marker")
 	}
 
-	// Extract ONLY the 5 fields needed for Phase 1 metrics
-	user := strings.TrimSpace(parts[1])        // Field 2: %u (user)
-	database := strings.TrimSpace(parts[2])    // Field 3: %d (database)
-	sqlstate := strings.TrimSpace(parts[6])    // Field 7: %e (SQLSTATE)
-	queryIDStr := strings.TrimSpace(parts[14]) // Field 15: %Q (query_id)
-	messageAndRest := parts[15]                // Field 16: severity + message
+	// Extract the part before :[%p] and find the last two colon-separated parts
+	// Format before :[%p] is: %m:%r:%u@%d
+	beforePid := line[:pidBracketIdx]
 
-	// Parse severity from the message part (e.g., "ERROR:  message text")
-	severity := extractSeverity(messageAndRest)
+	// Find the last occurrence of : before the :[, which separates %r from %u@%d
+	lastColonBeforePid := strings.LastIndex(beforePid, ":")
+	if lastColonBeforePid == -1 {
+		c.parseErrors.Inc()
+		return fmt.Errorf("invalid RDS log format: cannot locate user@database field")
+	}
+
+	// Extract user@database
+	userAtDatabase := beforePid[lastColonBeforePid+1:]
+
+	// Split user@database
+	atIdx := strings.Index(userAtDatabase, "@")
+	if atIdx == -1 {
+		c.parseErrors.Inc()
+		return fmt.Errorf("invalid RDS log format: missing @ in user@database field")
+	}
+
+	user := strings.TrimSpace(userAtDatabase[:atIdx])
+	database := strings.TrimSpace(userAtDatabase[atIdx+1:])
+
+	// Find the message part - it starts after %a (application name)
+	// Look for severity keywords (ERROR:, FATAL:, PANIC:) as they mark the start of the message
+	messageStart := -1
+	severity := ""
+	for sev := range supportedSeverities {
+		idx := strings.Index(line, sev+":")
+		if idx != -1 && (messageStart == -1 || idx < messageStart) {
+			messageStart = idx
+			severity = sev
+		}
+	}
+
+	if messageStart == -1 {
+		// No supported severity found, skip this line
+		return nil
+	}
 
 	// Filter: only process ERROR, FATAL, PANIC
 	if !supportedSeverities[severity] {
 		return nil // Skip INFO, LOG, WARNING, etc.
 	}
 
-	// Filter: skip if no SQLSTATE (can't categorize the error)
-	if sqlstate == "" {
-		return nil
-	}
-
-	// Parse query_id (may be 0 if not available)
-	queryID, _ := strconv.ParseInt(queryIDStr, 10, 64)
-
-	// Use existing helper functions to get error metadata
-	errorName := GetSQLStateErrorName(sqlstate)
-	sqlstateClass := ""
-	if len(sqlstate) >= 2 {
-		sqlstateClass = sqlstate[:2]
-	}
-	errorCategory := GetSQLStateCategory(sqlstate)
-
-	// Create minimal ParsedError for Phase 1
+	// Create ParsedError for metrics
 	parsed := &ParsedError{
 		ErrorSeverity: severity,
-		SQLState:      sqlstate,
-		ErrorName:     errorName,
-		SQLStateClass: sqlstateClass,
-		ErrorCategory: errorCategory,
 		User:          user,
 		DatabaseName:  database,
-		QueryID:       queryID,
 	}
 
-	// Emit metrics only (Phase 1)
+	// Emit metrics
 	c.updateMetrics(parsed)
 
 	return nil
@@ -340,33 +317,14 @@ func extractSeverity(message string) string {
 }
 
 func (c *ErrorLogs) updateMetrics(parsed *ParsedError) {
-	// Only emit metrics if we have a valid SQLSTATE
-	if parsed.SQLState == "" {
-		return
-	}
-
-	// Convert queryID to string for metric label
-	queryIDStr := ""
-	if parsed.QueryID > 0 {
-		queryIDStr = strconv.FormatInt(parsed.QueryID, 10)
-	}
-
 	c.errorsBySQLState.WithLabelValues(
-		parsed.SQLState,      // sqlstate: "57014"
-		parsed.ErrorName,     // error_name: "query_canceled"
-		parsed.SQLStateClass, // sqlstate_class: "57"
-		parsed.ErrorCategory, // error_category: "Operator Intervention"
 		parsed.ErrorSeverity, // severity: "ERROR"
 		parsed.DatabaseName,  // database: "books_store"
 		parsed.User,          // user: "app-user"
-		queryIDStr,           // queryid: "5457019535816659310"
 		c.instanceKey,        // instance: "orders_db"
 		c.systemID,           // server_id: "a1b2c3d4..."
 	).Inc()
 }
-
-// Phase 2: Loki log emission will be implemented here
-// For now, Phase 1 only emits metrics
 
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
