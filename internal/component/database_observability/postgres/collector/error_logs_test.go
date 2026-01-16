@@ -47,6 +47,7 @@ func TestErrorLogsCollector_ParseText(t *testing.T) {
 						require.Equal(t, "books_store", labels["database"])
 						require.Equal(t, "app-user", labels["user"])
 						require.Equal(t, "5457019535816659310", labels["queryid"])
+						require.Equal(t, "test-system", labels["server_id"])
 					}
 				}
 				require.True(t, found, "metric should exist")
@@ -154,13 +155,12 @@ func TestErrorLogsCollector_ParseText(t *testing.T) {
 			registry := prometheus.NewRegistry()
 
 			collector, err := NewErrorLogs(ErrorLogsArguments{
-				Receiver:              loki.NewLogsReceiver(),
-				EntryHandler:          entryHandler,
-				Logger:                log.NewNopLogger(),
-				InstanceKey:           "test-instance",
-				SystemID:              "test-system",
-				Registry:              registry,
-				DisableQueryRedaction: true,
+				Receiver:     loki.NewLogsReceiver(),
+				EntryHandler: entryHandler,
+				Logger:       log.NewNopLogger(),
+				InstanceKey:  "test-instance",
+				SystemID:     "test-system",
+				Registry:     registry,
 			})
 			require.NoError(t, err)
 
@@ -189,13 +189,12 @@ func TestErrorLogsCollector_StartStop(t *testing.T) {
 	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
 
 	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:              loki.NewLogsReceiver(),
-		EntryHandler:          entryHandler,
-		Logger:                log.NewNopLogger(),
-		InstanceKey:           "test",
-		SystemID:              "test",
-		Registry:              prometheus.NewRegistry(),
-		DisableQueryRedaction: true,
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test",
+		SystemID:     "test",
+		Registry:     prometheus.NewRegistry(),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, collector)
@@ -252,18 +251,88 @@ func TestErrorLogsCollector_ExtractSeverity(t *testing.T) {
 	}
 }
 
+func TestErrorLogsCollector_IsContinuationLine(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		expected bool
+	}{
+		{
+			name:     "tab-indented line",
+			line:     "\tThis probably means the server terminated abnormally",
+			expected: true,
+		},
+		{
+			name:     "DETAIL line",
+			line:     "DETAIL:  Key (author_id)=(99999) is not present in table \"authors\".",
+			expected: true,
+		},
+		{
+			name:     "HINT line",
+			line:     "HINT:  Check the foreign key constraint.",
+			expected: true,
+		},
+		{
+			name:     "CONTEXT line",
+			line:     "CONTEXT:  SQL statement \"SELECT * FROM books WHERE author_id = 123\"",
+			expected: true,
+		},
+		{
+			name:     "STATEMENT line",
+			line:     "STATEMENT:  INSERT INTO books (title, author_id) VALUES ('Test', 99999)",
+			expected: true,
+		},
+		{
+			name:     "QUERY line",
+			line:     "QUERY:  SELECT 1",
+			expected: true,
+		},
+		{
+			name:     "LOCATION line",
+			line:     "LOCATION:  postgres.c:1234",
+			expected: true,
+		},
+		{
+			name:     "DETAIL with leading whitespace",
+			line:     "  DETAIL:  Some detail text",
+			expected: true,
+		},
+		{
+			name:     "regular log line",
+			line:     "2025-12-12 15:29:23.258 GMT|app-user|books_store|[local]|9185|9|57014|2025-12-12 15:29:19 GMT|36/148|837|693c34cf.23e1|SELECT|0|psql|5457019535816659310|ERROR:  canceling statement due to statement timeout",
+			expected: false,
+		},
+		{
+			name:     "empty line",
+			line:     "",
+			expected: false,
+		},
+		{
+			name:     "error in continuation keyword",
+			line:     "ERROR:  some error message",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isContinuationLine(tt.line)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 func TestErrorLogsCollector_InvalidLogFormat(t *testing.T) {
 	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
 	registry := prometheus.NewRegistry()
 
 	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:              loki.NewLogsReceiver(),
-		EntryHandler:          entryHandler,
-		Logger:                log.NewNopLogger(),
-		InstanceKey:           "test",
-		SystemID:              "test",
-		Registry:              registry,
-		DisableQueryRedaction: true,
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test",
+		SystemID:     "test",
+		Registry:     registry,
 	})
 	require.NoError(t, err)
 
@@ -293,19 +362,71 @@ func TestErrorLogsCollector_InvalidLogFormat(t *testing.T) {
 	require.True(t, found, "parse error metric should exist")
 }
 
+func TestErrorLogsCollector_ContinuationLinesDoNotIncrementParseFailures(t *testing.T) {
+	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
+	registry := prometheus.NewRegistry()
+
+	collector, err := NewErrorLogs(ErrorLogsArguments{
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test",
+		SystemID:     "test-system-id",
+		Registry:     registry,
+	})
+	require.NoError(t, err)
+
+	err = collector.Start(context.Background())
+	require.NoError(t, err)
+	defer collector.Stop()
+
+	// Send continuation lines (should NOT increment parse failures)
+	continuationLines := []string{
+		"\tThis probably means the server terminated abnormally",
+		"DETAIL:  Key (author_id)=(99999) is not present in table \"authors\".",
+		"HINT:  Check the foreign key constraint.",
+		"CONTEXT:  SQL statement \"SELECT * FROM books WHERE author_id = 123\"",
+		"STATEMENT:  INSERT INTO books (title, author_id) VALUES ('Test', 99999)",
+	}
+
+	for _, line := range continuationLines {
+		collector.Receiver().Chan() <- loki.Entry{
+			Entry: push.Entry{
+				Line:      line,
+				Timestamp: time.Now(),
+			},
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that parse errors counter was NOT incremented (should be 0)
+	mfs, _ := registry.Gather()
+	parseFailuresFound := false
+	for _, mf := range mfs {
+		if mf.GetName() == "postgres_error_log_parse_failures_total" {
+			parseFailuresFound = true
+			// Should be 0 since continuation lines don't count as parse failures
+			require.Equal(t, 0.0, mf.GetMetric()[0].GetCounter().GetValue())
+		}
+	}
+
+	// The metric should exist but be zero
+	require.True(t, parseFailuresFound, "parse failures metric should exist")
+}
+
 // TestErrorLogsCollector_RDSLikeLogs tests with comprehensive RDS-like log samples
 func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 100), func() {})
 	registry := prometheus.NewRegistry()
 
 	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:              loki.NewLogsReceiver(),
-		EntryHandler:          entryHandler,
-		Logger:                log.NewNopLogger(),
-		InstanceKey:           "rds-test-instance",
-		SystemID:              "rds-system",
-		Registry:              registry,
-		DisableQueryRedaction: true,
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "rds-test-instance",
+		SystemID:     "rds-system",
+		Registry:     registry,
 	})
 	require.NoError(t, err)
 

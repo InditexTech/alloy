@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -92,22 +93,20 @@ type ParsedError struct {
 }
 
 type ErrorLogsArguments struct {
-	Receiver              loki.LogsReceiver
-	EntryHandler          loki.EntryHandler
-	Logger                log.Logger
-	InstanceKey           string
-	SystemID              string
-	Registry              *prometheus.Registry
-	DisableQueryRedaction bool
+	Receiver     loki.LogsReceiver
+	EntryHandler loki.EntryHandler
+	Logger       log.Logger
+	InstanceKey  string
+	SystemID     string
+	Registry     *prometheus.Registry
 }
 
 type ErrorLogs struct {
-	logger                log.Logger
-	entryHandler          loki.EntryHandler
-	instanceKey           string
-	systemID              string
-	registry              *prometheus.Registry
-	disableQueryRedaction bool
+	logger       log.Logger
+	entryHandler loki.EntryHandler
+	instanceKey  string
+	systemID     string
+	registry     *prometheus.Registry
 
 	receiver loki.LogsReceiver
 
@@ -124,16 +123,15 @@ func NewErrorLogs(args ErrorLogsArguments) (*ErrorLogs, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &ErrorLogs{
-		logger:                log.With(args.Logger, "collector", ErrorLogsCollector),
-		entryHandler:          args.EntryHandler,
-		instanceKey:           args.InstanceKey,
-		systemID:              args.SystemID,
-		registry:              args.Registry,
-		disableQueryRedaction: args.DisableQueryRedaction,
-		receiver:              args.Receiver,
-		ctx:                   ctx,
-		cancel:                cancel,
-		stopped:               atomic.NewBool(false),
+		logger:       log.With(args.Logger, "collector", ErrorLogsCollector),
+		entryHandler: args.EntryHandler,
+		instanceKey:  args.InstanceKey,
+		systemID:     args.SystemID,
+		registry:     args.Registry,
+		receiver:     args.Receiver,
+		ctx:          ctx,
+		cancel:       cancel,
+		stopped:      atomic.NewBool(false),
 	}
 
 	e.initMetrics()
@@ -147,7 +145,7 @@ func (c *ErrorLogs) initMetrics() {
 			Name: "postgres_errors_by_sqlstate_query_user_total",
 			Help: "PostgreSQL errors by SQLSTATE code with database, user, queryid, and instance tracking",
 		},
-		[]string{"sqlstate", "error_name", "sqlstate_class", "error_category", "severity", "database", "user", "queryid", "instance"},
+		[]string{"sqlstate", "error_name", "sqlstate_class", "error_category", "severity", "database", "user", "queryid", "instance", "server_id"},
 	)
 
 	c.parseErrors = prometheus.NewCounter(
@@ -226,6 +224,24 @@ func (c *ErrorLogs) processLogLine(entry loki.Entry) error {
 func (c *ErrorLogs) parseTextLog(entry loki.Entry) error {
 	line := entry.Entry.Line
 
+	// CloudWatch/OTLP logs come wrapped in JSON with a "body" field
+	// Example: {"body":"2026-01-15 15:39:17 UTC:10.24.194.153(35450):...","attributes":{...}}
+	// Extract the actual log line from the body field if present
+	if strings.HasPrefix(line, "{") {
+		var jsonLog struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(line), &jsonLog); err == nil && jsonLog.Body != "" {
+			line = jsonLog.Body
+		}
+	}
+
+	// Check if this is a continuation line (DETAIL, HINT, CONTEXT, STATEMENT, etc.)
+	// These are expected in multi-line errors and should not be counted as parse failures
+	if isContinuationLine(line) {
+		return nil // Skip continuation lines silently in Phase 1
+	}
+
 	// Split into 16 parts: 15 prefix fields + message
 	parts := strings.SplitN(line, "|", 16)
 	if len(parts) < 16 {
@@ -285,6 +301,36 @@ func (c *ErrorLogs) parseTextLog(entry loki.Entry) error {
 // extractSeverity parses the severity from the message part.
 // Input: "ERROR:  canceling statement due to timeout"
 // Output: "ERROR"
+// isContinuationLine checks if a log line is a multi-line error continuation.
+// PostgreSQL outputs multi-line errors with continuation lines that start with:
+// - Tab character(s) for indented content
+// - Known keywords: DETAIL, HINT, CONTEXT, STATEMENT, QUERY, LOCATION
+func isContinuationLine(line string) bool {
+	// Check for tab-indented lines (common for continuation context)
+	if strings.HasPrefix(line, "\t") {
+		return true
+	}
+
+	// Check for known continuation keywords at the start of the line
+	continuationKeywords := []string{
+		"DETAIL:",
+		"HINT:",
+		"CONTEXT:",
+		"STATEMENT:",
+		"QUERY:",
+		"LOCATION:",
+	}
+
+	trimmedLine := strings.TrimSpace(line)
+	for _, keyword := range continuationKeywords {
+		if strings.HasPrefix(trimmedLine, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func extractSeverity(message string) string {
 	// Format is typically "SEVERITY:  message text"
 	if idx := strings.Index(message, ":"); idx > 0 {
@@ -315,6 +361,7 @@ func (c *ErrorLogs) updateMetrics(parsed *ParsedError) {
 		parsed.User,          // user: "app-user"
 		queryIDStr,           // queryid: "5457019535816659310"
 		c.instanceKey,        // instance: "orders_db"
+		c.systemID,           // server_id: "a1b2c3d4..."
 	).Inc()
 }
 
