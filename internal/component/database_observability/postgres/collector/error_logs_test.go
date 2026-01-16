@@ -570,7 +570,7 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 		for _, label := range metric.GetLabel() {
 			labels[label.GetName()] = label.GetValue()
 		}
-		
+
 		key := metricKey{
 			user:     labels["user"],
 			database: labels["database"],
@@ -581,22 +581,22 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 
 	// Verify each expected key exists and has the correct count
 	for key, expectedCount := range expectedCounts {
-		require.True(t, capturedMetrics[key], "Expected metric for user=%s, database=%s, severity=%s", 
+		require.True(t, capturedMetrics[key], "Expected metric for user=%s, database=%s, severity=%s",
 			key.user, key.database, key.severity)
-		
+
 		actualCount := actualCounts[key]
-		require.Equal(t, float64(expectedCount), actualCount, 
+		require.Equal(t, float64(expectedCount), actualCount,
 			"Metric count mismatch for user=%s, database=%s, severity=%s: expected %d, got %.0f",
 			key.user, key.database, key.severity, expectedCount, actualCount)
 	}
 
 	// Verify specific summed metrics
 	appUserBooksStoreKey := metricKey{user: "app-user", database: "books_store", severity: "ERROR"}
-	require.Equal(t, float64(3), actualCounts[appUserBooksStoreKey], 
+	require.Equal(t, float64(3), actualCounts[appUserBooksStoreKey],
 		"app-user@books_store:ERROR should have count of 3 (appears 3 times in samples)")
-	
+
 	connLimitedKey := metricKey{user: "conn_limited", database: "books_store", severity: "FATAL"}
-	require.Equal(t, float64(2), actualCounts[connLimitedKey], 
+	require.Equal(t, float64(2), actualCounts[connLimitedKey],
 		"conn_limited@books_store:FATAL should have count of 2 (appears 2 times in samples)")
 
 	// Verify logs without SQLSTATE or with INFO/LOG severity were skipped
