@@ -438,8 +438,8 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 			severity: "ERROR",
 		},
 		{
-			log:      `2025-01-12 10:31:23.258 UTC:10.0.1.5:54321:app-user@books_store:[9185]:9:40P01:2025-01-12 10:29:19 UTC:36/148:837:693c34cf.23e1::webappERROR:  deadlock detected`,
-			user:     "app-user",
+			log:      `2025-01-12 10:31:23.258 UTC:10.0.1.5:54321:db-admin@books_store:[9185]:9:40P01:2025-01-12 10:29:19 UTC:36/148:837:693c34cf.23e1::webappERROR:  deadlock detected`,
+			user:     "db-admin",
 			database: "books_store",
 			severity: "ERROR",
 		},
@@ -479,6 +479,25 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 			database: "app_db",
 			severity: "ERROR",
 		},
+		// Duplicate samples to test metric summing (same labels should increment counter)
+		{
+			log:      `2025-01-12 10:45:00.123 UTC:10.0.1.5:54321:app-user@books_store:[9200]:10:57014:2025-01-12 10:29:15 UTC:25/200:0:693c34cb.9999::psqlERROR:  canceling statement due to user request`,
+			user:     "app-user",
+			database: "books_store",
+			severity: "ERROR",
+		},
+		{
+			log:      `2025-01-12 10:46:00.456 UTC:10.0.1.5:54322:app-user@books_store:[9201]:11:57014:2025-01-12 10:29:15 UTC:25/201:0:693c34cb.9998::psqlERROR:  another timeout error`,
+			user:     "app-user",
+			database: "books_store",
+			severity: "ERROR",
+		},
+		{
+			log:      `2025-01-12 10:47:00.789 UTC:10.0.1.10:45678:conn_limited@books_store:[9450]:5:53300:2025-01-12 10:32:31 UTC:91/58:0:693c34db.9997::api_workerFATAL:  too many connections for role "conn_limited" again`,
+			user:     "conn_limited",
+			database: "books_store",
+			severity: "FATAL",
+		},
 	}
 
 	// Send all log samples
@@ -504,7 +523,8 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 	}
 
 	require.NotNil(t, errorMetrics, "error metrics should exist")
-	require.GreaterOrEqual(t, len(errorMetrics.GetMetric()), len(logSamples), "should have metrics for all error types")
+	// Note: We have 11 log samples but only 8 unique label combinations (some are duplicates for testing summing)
+	require.Equal(t, 8, len(errorMetrics.GetMetric()), "should have 8 unique metric label combinations")
 
 	// Verify that all expected user/database/severity combinations were captured
 	type metricKey struct {
@@ -533,15 +553,51 @@ func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
 	}
 
 	// Verify all expected samples were captured
+	expectedCounts := make(map[metricKey]int)
 	for _, sample := range logSamples {
 		key := metricKey{
 			user:     sample.user,
 			database: sample.database,
 			severity: sample.severity,
 		}
-		require.True(t, capturedMetrics[key], "Expected metric for user=%s, database=%s, severity=%s",
-			sample.user, sample.database, sample.severity)
+		expectedCounts[key]++
 	}
+
+	// Count actual occurrences in metrics
+	actualCounts := make(map[metricKey]float64)
+	for _, metric := range errorMetrics.GetMetric() {
+		labels := make(map[string]string)
+		for _, label := range metric.GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		
+		key := metricKey{
+			user:     labels["user"],
+			database: labels["database"],
+			severity: labels["severity"],
+		}
+		actualCounts[key] = metric.GetCounter().GetValue()
+	}
+
+	// Verify each expected key exists and has the correct count
+	for key, expectedCount := range expectedCounts {
+		require.True(t, capturedMetrics[key], "Expected metric for user=%s, database=%s, severity=%s", 
+			key.user, key.database, key.severity)
+		
+		actualCount := actualCounts[key]
+		require.Equal(t, float64(expectedCount), actualCount, 
+			"Metric count mismatch for user=%s, database=%s, severity=%s: expected %d, got %.0f",
+			key.user, key.database, key.severity, expectedCount, actualCount)
+	}
+
+	// Verify specific summed metrics
+	appUserBooksStoreKey := metricKey{user: "app-user", database: "books_store", severity: "ERROR"}
+	require.Equal(t, float64(3), actualCounts[appUserBooksStoreKey], 
+		"app-user@books_store:ERROR should have count of 3 (appears 3 times in samples)")
+	
+	connLimitedKey := metricKey{user: "conn_limited", database: "books_store", severity: "FATAL"}
+	require.Equal(t, float64(2), actualCounts[connLimitedKey], 
+		"conn_limited@books_store:FATAL should have count of 2 (appears 2 times in samples)")
 
 	// Verify logs without SQLSTATE or with INFO/LOG severity were skipped
 	collector.Receiver().Chan() <- loki.Entry{

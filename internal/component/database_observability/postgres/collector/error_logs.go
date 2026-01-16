@@ -208,37 +208,36 @@ func (c *ErrorLogs) parseTextLog(entry loki.Entry) error {
 	// Parse RDS format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
 	// Example: 2025-01-12 10:30:45 UTC:10.0.1.5:54321:app-user@books_store:[9112]:4:57014:...ERROR:  message
 
-	// Find the user@database part by looking for the pattern before :[
-	// This helps us locate the boundary since [%p] is distinctive
-	pidBracketIdx := strings.Index(line, ":[")
-	if pidBracketIdx == -1 {
-		c.parseErrors.Inc()
-		return fmt.Errorf("invalid RDS log format: missing :[pid] marker")
-	}
-
-	// Extract the part before :[%p] and find the last two colon-separated parts
-	// Format before :[%p] is: %m:%r:%u@%d
-	beforePid := line[:pidBracketIdx]
-
-	// Find the last occurrence of : before the :[, which separates %r from %u@%d
-	lastColonBeforePid := strings.LastIndex(beforePid, ":")
-	if lastColonBeforePid == -1 {
-		c.parseErrors.Inc()
-		return fmt.Errorf("invalid RDS log format: cannot locate user@database field")
-	}
-
-	// Extract user@database
-	userAtDatabase := beforePid[lastColonBeforePid+1:]
-
-	// Split user@database
-	atIdx := strings.Index(userAtDatabase, "@")
+	// Find the @database: pattern which reliably marks the database field
+	// The format is %u@%d:[%p] so we look for @...:[
+	atIdx := strings.Index(line, "@")
 	if atIdx == -1 {
 		c.parseErrors.Inc()
-		return fmt.Errorf("invalid RDS log format: missing @ in user@database field")
+		return fmt.Errorf("invalid RDS log format: missing @ in user@database")
 	}
 
-	user := strings.TrimSpace(userAtDatabase[:atIdx])
-	database := strings.TrimSpace(userAtDatabase[atIdx+1:])
+	// From @ onwards, find the :[ pattern that marks the PID
+	// We need to find :[digit...]: pattern
+	afterAt := line[atIdx+1:]
+	pidMarkerIdx := strings.Index(afterAt, ":[")
+	if pidMarkerIdx == -1 {
+		c.parseErrors.Inc()
+		return fmt.Errorf("invalid RDS log format: missing :[pid] marker after database")
+	}
+
+	// Extract database name (between @ and :[)
+	database := strings.TrimSpace(afterAt[:pidMarkerIdx])
+
+	// Extract user name (work backwards from @)
+	// Find the last : before the @ to get the user field
+	beforeAt := line[:atIdx]
+	lastColonBeforeAt := strings.LastIndex(beforeAt, ":")
+	if lastColonBeforeAt == -1 {
+		c.parseErrors.Inc()
+		return fmt.Errorf("invalid RDS log format: cannot locate user field")
+	}
+
+	user := strings.TrimSpace(beforeAt[lastColonBeforeAt+1:])
 
 	// Find the message part - it starts after %a (application name)
 	// Look for severity keywords (ERROR:, FATAL:, PANIC:) as they mark the start of the message
