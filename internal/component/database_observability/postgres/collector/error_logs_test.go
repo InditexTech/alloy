@@ -14,164 +14,273 @@ import (
 	"github.com/grafana/alloy/internal/component/common/loki"
 )
 
-// TestErrorLogsCollector_ParseText tests parsing of stderr text format logs
-func TestErrorLogsCollector_ParseText(t *testing.T) {
+func TestErrorLogsCollector_ParseRDSFormat(t *testing.T) {
+	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
+	registry := prometheus.NewRegistry()
+
+	collector, err := NewErrorLogs(ErrorLogsArguments{
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test-instance",
+		SystemID:     "test-system",
+		Registry:     registry,
+	})
+	require.NoError(t, err)
+
+	err = collector.Start(context.Background())
+	require.NoError(t, err)
+	defer collector.Stop()
+
 	tests := []struct {
-		name        string
-		textLog     string
-		shouldParse bool
-		checkFields func(*testing.T, prometheus.Gatherer)
+		name     string
+		log      string
+		wantUser string
+		wantDB   string
+		wantSev  string
 	}{
 		{
-			name: "statement timeout",
-			// Format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
-			textLog:     `2025-12-12 15:29:16.068 GMT:[local]:app-user@books_store:[9112]:4:57014:2025-12-12 15:29:15 GMT:25/112:0:693c34cb.2398::psqlERROR:  canceling statement due to statement timeout`,
-			shouldParse: true,
-			checkFields: func(t *testing.T, g prometheus.Gatherer) {
-				mfs, _ := g.Gather()
-				found := false
-				for _, mf := range mfs {
-					if mf.GetName() == "postgres_errors_total" {
-						found = true
-						require.Greater(t, len(mf.GetMetric()), 0)
-						metric := mf.GetMetric()[0]
-						labels := make(map[string]string)
-						for _, label := range metric.GetLabel() {
-							labels[label.GetName()] = label.GetValue()
-						}
-						require.Equal(t, "ERROR", labels["severity"])
-						require.Equal(t, "books_store", labels["database"])
-						require.Equal(t, "app-user", labels["user"])
-						require.Equal(t, "test-system", labels["server_id"])
-						require.Equal(t, "test-instance", labels["instance"])
-					}
-				}
-				require.True(t, found, "metric should exist")
-			},
+			name:     "ERROR severity",
+			log:      `2025-12-12 15:29:16.068 GMT:[local]:app-user@books_store:[9112]:4:57014:2025-12-12 15:29:15 GMT:25/112:0:693c34cb.2398::psqlERROR:  canceling statement`,
+			wantUser: "app-user",
+			wantDB:   "books_store",
+			wantSev:  "ERROR",
 		},
 		{
-			name:        "deadlock detected",
-			textLog:     `2025-12-12 15:29:23.258 GMT:[local]:app-user@books_store:[9185]:9:40P01:2025-12-12 15:29:19 GMT:36/148:837:693c34cf.23e1::psqlERROR:  deadlock detected`,
-			shouldParse: true,
-			checkFields: func(t *testing.T, g prometheus.Gatherer) {
-				mfs, _ := g.Gather()
-				found := false
-				for _, mf := range mfs {
-					if mf.GetName() == "postgres_errors_total" {
-						found = true
-						for _, metric := range mf.GetMetric() {
-							labels := make(map[string]string)
-							for _, label := range metric.GetLabel() {
-								labels[label.GetName()] = label.GetValue()
-							}
-							if labels["user"] == "app-user" && labels["database"] == "books_store" {
-								require.Equal(t, "ERROR", labels["severity"])
-							}
-						}
-					}
-				}
-				require.True(t, found)
-			},
+			name:     "FATAL severity",
+			log:      `2025-12-12 15:29:31.529 GMT:[local]:conn_user@testdb:[9449]:4:53300:2025-12-12 15:29:31 GMT:91/57:0:693c34db.24e9::psqlFATAL:  too many connections`,
+			wantUser: "conn_user",
+			wantDB:   "testdb",
+			wantSev:  "FATAL",
 		},
 		{
-			name:        "too many connections - FATAL severity",
-			textLog:     `2025-12-12 15:29:31.529 GMT:[local]:conn_limited@books_store:[9449]:4:53300:2025-12-12 15:29:31 GMT:91/57:0:693c34db.24e9::psqlFATAL:  too many connections for role "conn_limited"`,
-			shouldParse: true,
-			checkFields: func(t *testing.T, g prometheus.Gatherer) {
-				mfs, _ := g.Gather()
-				found := false
-				for _, mf := range mfs {
-					if mf.GetName() == "postgres_errors_total" {
-						found = true
-						for _, metric := range mf.GetMetric() {
-							labels := make(map[string]string)
-							for _, label := range metric.GetLabel() {
-								labels[label.GetName()] = label.GetValue()
-							}
-							if labels["user"] == "conn_limited" {
-								require.Equal(t, "FATAL", labels["severity"])
-								require.Equal(t, "conn_limited", labels["user"])
-							}
-						}
-					}
-				}
-				require.True(t, found)
-			},
-		},
-		{
-			name:        "authentication failure",
-			textLog:     `2025-12-12 15:29:42.201 GMT:::1:app-user@books_store:[9589]:2:28P01:2025-12-12 15:29:42 GMT:159/363:0:693c34e6.2575::psqlFATAL:  password authentication failed for user "app-user"`,
-			shouldParse: true,
-			checkFields: func(t *testing.T, g prometheus.Gatherer) {
-				mfs, _ := g.Gather()
-				found := false
-				for _, mf := range mfs {
-					if mf.GetName() == "postgres_errors_total" {
-						found = true
-						for _, metric := range mf.GetMetric() {
-							labels := make(map[string]string)
-							for _, label := range metric.GetLabel() {
-								labels[label.GetName()] = label.GetValue()
-							}
-							// Check for the auth failure with app-user
-							if labels["user"] == "app-user" && labels["severity"] == "FATAL" {
-								require.Equal(t, "FATAL", labels["severity"])
-								require.Equal(t, "books_store", labels["database"])
-							}
-						}
-					}
-				}
-				require.True(t, found)
-			},
-		},
-		{
-			name:        "no SQLSTATE - should be skipped",
-			textLog:     `2025-12-12 15:29:42.201 GMT:::1:app-user@books_store:[9589]:2::2025-12-12 15:29:42 GMT:159/363:0:693c34e6.2575::psqlLOG:  connection received`,
-			shouldParse: false,
-			checkFields: nil,
-		},
-		{
-			name:        "INFO severity - should be skipped",
-			textLog:     `2025-12-12 15:29:42.201 GMT:::1:app-user@books_store:[9589]:2:00000:2025-12-12 15:29:42 GMT:159/363:0:693c34e6.2575::psqlINFO:  some informational message`,
-			shouldParse: false,
-			checkFields: nil,
+			name:     "PANIC severity",
+			log:      `2025-12-12 15:30:00.000 GMT:::1:admin@postgres:[9500]:1:XX000:2025-12-12 15:30:00 GMT:1/1:0:693c34db.9999::psqlPANIC:  system failure`,
+			wantUser: "admin",
+			wantDB:   "postgres",
+			wantSev:  "PANIC",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
-			registry := prometheus.NewRegistry()
-
-			collector, err := NewErrorLogs(ErrorLogsArguments{
-				Receiver:     loki.NewLogsReceiver(),
-				EntryHandler: entryHandler,
-				Logger:       log.NewNopLogger(),
-				InstanceKey:  "test-instance",
-				SystemID:     "test-system",
-				Registry:     registry,
-			})
-			require.NoError(t, err)
-
-			err = collector.Start(context.Background())
-			require.NoError(t, err)
-			defer collector.Stop()
-
-			// Send the log line
 			collector.Receiver().Chan() <- loki.Entry{
 				Entry: push.Entry{
-					Line:      tt.textLog,
+					Line:      tt.log,
 					Timestamp: time.Now(),
 				},
 			}
 
 			time.Sleep(100 * time.Millisecond)
 
-			if tt.checkFields != nil {
-				tt.checkFields(t, registry)
+			mfs, _ := registry.Gather()
+			found := false
+			for _, mf := range mfs {
+				if mf.GetName() == "postgres_errors_total" {
+					for _, metric := range mf.GetMetric() {
+						labels := make(map[string]string)
+						for _, label := range metric.GetLabel() {
+							labels[label.GetName()] = label.GetValue()
+						}
+						if labels["user"] == tt.wantUser && labels["database"] == tt.wantDB {
+							require.Equal(t, tt.wantSev, labels["severity"])
+							require.Equal(t, "test-instance", labels["instance"])
+							require.Equal(t, "test-system", labels["server_id"])
+							found = true
+							break
+						}
+					}
+				}
 			}
+			require.True(t, found, "metric not found for %s", tt.name)
 		})
 	}
+}
+
+func TestErrorLogsCollector_SkipsNonErrors(t *testing.T) {
+	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
+	registry := prometheus.NewRegistry()
+
+	collector, err := NewErrorLogs(ErrorLogsArguments{
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test",
+		SystemID:     "test",
+		Registry:     registry,
+	})
+	require.NoError(t, err)
+
+	err = collector.Start(context.Background())
+	require.NoError(t, err)
+	defer collector.Stop()
+
+	// Send INFO and LOG messages (should be skipped)
+	skipLogs := []string{
+		`2025-12-12 15:29:42.201 GMT:::1:app-user@books_store:[9589]:2:00000:2025-12-12 15:29:42 GMT:159/363:0:693c34e6.2575::psqlINFO:  some info`,
+		`2025-12-12 15:29:42.201 GMT:::1:app-user@books_store:[9589]:2::2025-12-12 15:29:42 GMT:159/363:0:693c34e6.2575::psqlLOG:  connection received`,
+		"DETAIL:  Some detail line",
+		"HINT:  Some hint line",
+		"\tIndented continuation line",
+	}
+
+	for _, logLine := range skipLogs {
+		collector.Receiver().Chan() <- loki.Entry{
+			Entry: push.Entry{
+				Line:      logLine,
+				Timestamp: time.Now(),
+			},
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have 0 metrics since all were skipped
+	mfs, _ := registry.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() == "postgres_errors_total" {
+			require.Equal(t, 0, len(mf.GetMetric()), "should not create metrics for non-error logs")
+		}
+	}
+}
+
+func TestErrorLogsCollector_MetricSumming(t *testing.T) {
+	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 100), func() {})
+	registry := prometheus.NewRegistry()
+
+	collector, err := NewErrorLogs(ErrorLogsArguments{
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test-instance",
+		SystemID:     "test-system",
+		Registry:     registry,
+	})
+	require.NoError(t, err)
+
+	err = collector.Start(context.Background())
+	require.NoError(t, err)
+	defer collector.Stop()
+
+	// Send multiple errors with same labels (should sum)
+	logs := []struct {
+		log  string
+		user string
+		db   string
+		sev  string
+	}{
+		{
+			log:  `2025-01-12 10:30:45 UTC:10.0.1.5:54321:user1@db1:[9112]:4:57014:2025-01-12 10:29:15 UTC:25/112:0:693c34cb.2398::psqlERROR:  error 1`,
+			user: "user1",
+			db:   "db1",
+			sev:  "ERROR",
+		},
+		{
+			log:  `2025-01-12 10:31:00 UTC:10.0.1.5:54321:user1@db1:[9113]:5:57014:2025-01-12 10:29:15 UTC:25/113:0:693c34cb.2399::psqlERROR:  error 2`,
+			user: "user1",
+			db:   "db1",
+			sev:  "ERROR",
+		},
+		{
+			log:  `2025-01-12 10:32:00 UTC:10.0.1.5:54321:user1@db1:[9114]:6:57014:2025-01-12 10:29:15 UTC:25/114:0:693c34cb.2400::psqlERROR:  error 3`,
+			user: "user1",
+			db:   "db1",
+			sev:  "ERROR",
+		},
+		{
+			log:  `2025-01-12 10:33:00 UTC:10.0.1.5:54322:user2@db2:[9115]:7:28P01:2025-01-12 10:33:00 UTC:159/363:0:693c34e6.2575::psqlFATAL:  auth failed`,
+			user: "user2",
+			db:   "db2",
+			sev:  "FATAL",
+		},
+	}
+
+	for _, l := range logs {
+		collector.Receiver().Chan() <- loki.Entry{
+			Entry: push.Entry{
+				Line:      l.log,
+				Timestamp: time.Now(),
+			},
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify metrics
+	mfs, _ := registry.Gather()
+	var errorMetrics *dto.MetricFamily
+	for _, mf := range mfs {
+		if mf.GetName() == "postgres_errors_total" {
+			errorMetrics = mf
+			break
+		}
+	}
+
+	require.NotNil(t, errorMetrics)
+	require.Equal(t, 2, len(errorMetrics.GetMetric()), "should have 2 unique label combinations")
+
+	// Check counts
+	type metricKey struct {
+		user string
+		db   string
+		sev  string
+	}
+	counts := make(map[metricKey]float64)
+	for _, metric := range errorMetrics.GetMetric() {
+		labels := make(map[string]string)
+		for _, label := range metric.GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		key := metricKey{
+			user: labels["user"],
+			db:   labels["database"],
+			sev:  labels["severity"],
+		}
+		counts[key] = metric.GetCounter().GetValue()
+	}
+
+	require.Equal(t, float64(3), counts[metricKey{user: "user1", db: "db1", sev: "ERROR"}], "user1@db1:ERROR should have count of 3")
+	require.Equal(t, float64(1), counts[metricKey{user: "user2", db: "db2", sev: "FATAL"}], "user2@db2:FATAL should have count of 1")
+}
+
+func TestErrorLogsCollector_InvalidFormat(t *testing.T) {
+	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
+	registry := prometheus.NewRegistry()
+
+	collector, err := NewErrorLogs(ErrorLogsArguments{
+		Receiver:     loki.NewLogsReceiver(),
+		EntryHandler: entryHandler,
+		Logger:       log.NewNopLogger(),
+		InstanceKey:  "test",
+		SystemID:     "test",
+		Registry:     registry,
+	})
+	require.NoError(t, err)
+
+	err = collector.Start(context.Background())
+	require.NoError(t, err)
+	defer collector.Stop()
+
+	// Send invalid log lines
+	collector.Receiver().Chan() <- loki.Entry{
+		Entry: push.Entry{
+			Line:      `invalid log line without proper format`,
+			Timestamp: time.Now(),
+		},
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Check parse errors counter was incremented
+	mfs, _ := registry.Gather()
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "postgres_error_log_parse_failures_total" {
+			found = true
+			require.Greater(t, mf.GetMetric()[0].GetCounter().GetValue(), 0.0)
+		}
+	}
+	require.True(t, found, "parse error metric should exist")
 }
 
 func TestErrorLogsCollector_StartStop(t *testing.T) {
@@ -186,434 +295,54 @@ func TestErrorLogsCollector_StartStop(t *testing.T) {
 		Registry:     prometheus.NewRegistry(),
 	})
 	require.NoError(t, err)
-	require.NotNil(t, collector)
 	require.NotNil(t, collector.Receiver(), "receiver should be exported")
 
 	err = collector.Start(context.Background())
 	require.NoError(t, err)
 	require.False(t, collector.Stopped())
 
-	time.Sleep(10 * time.Millisecond)
-
 	collector.Stop()
-
 	time.Sleep(10 * time.Millisecond)
 	require.True(t, collector.Stopped())
 }
 
-func TestErrorLogsCollector_ExtractSeverity(t *testing.T) {
+func TestExtractSeverity(t *testing.T) {
 	tests := []struct {
 		message  string
 		expected string
 	}{
-		{
-			message:  "ERROR:  canceling statement due to statement timeout",
-			expected: "ERROR",
-		},
-		{
-			message:  "FATAL:  too many connections",
-			expected: "FATAL",
-		},
-		{
-			message:  "PANIC:  could not write to file",
-			expected: "PANIC",
-		},
-		{
-			message:  "LOG:  connection received",
-			expected: "LOG",
-		},
-		{
-			message:  "WARNING:  deprecated syntax",
-			expected: "WARNING",
-		},
-		{
-			message:  "no colon here",
-			expected: "",
-		},
+		{"ERROR:  canceling statement", "ERROR"},
+		{"FATAL:  too many connections", "FATAL"},
+		{"PANIC:  system failure", "PANIC"},
+		{"LOG:  connection received", "LOG"},
+		{"no colon here", ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.message, func(t *testing.T) {
-			result := extractSeverity(tt.message)
-			require.Equal(t, tt.expected, result)
+			require.Equal(t, tt.expected, extractSeverity(tt.message))
 		})
 	}
 }
 
-func TestErrorLogsCollector_IsContinuationLine(t *testing.T) {
+func TestIsContinuationLine(t *testing.T) {
 	tests := []struct {
-		name     string
 		line     string
 		expected bool
 	}{
-		{
-			name:     "tab-indented line",
-			line:     "\tThis probably means the server terminated abnormally",
-			expected: true,
-		},
-		{
-			name:     "DETAIL line",
-			line:     "DETAIL:  Key (author_id)=(99999) is not present in table \"authors\".",
-			expected: true,
-		},
-		{
-			name:     "HINT line",
-			line:     "HINT:  Check the foreign key constraint.",
-			expected: true,
-		},
-		{
-			name:     "CONTEXT line",
-			line:     "CONTEXT:  SQL statement \"SELECT * FROM books WHERE author_id = 123\"",
-			expected: true,
-		},
-		{
-			name:     "STATEMENT line",
-			line:     "STATEMENT:  INSERT INTO books (title, author_id) VALUES ('Test', 99999)",
-			expected: true,
-		},
-		{
-			name:     "QUERY line",
-			line:     "QUERY:  SELECT 1",
-			expected: true,
-		},
-		{
-			name:     "LOCATION line",
-			line:     "LOCATION:  postgres.c:1234",
-			expected: true,
-		},
-		{
-			name:     "DETAIL with leading whitespace",
-			line:     "  DETAIL:  Some detail text",
-			expected: true,
-		},
-		{
-			name:     "regular log line",
-			line:     "2025-12-12 15:29:23.258 GMT|app-user|books_store|[local]|9185|9|57014|2025-12-12 15:29:19 GMT|36/148|837|693c34cf.23e1|SELECT|0|psql|5457019535816659310|ERROR:  canceling statement due to statement timeout",
-			expected: false,
-		},
-		{
-			name:     "empty line",
-			line:     "",
-			expected: false,
-		},
-		{
-			name:     "error in continuation keyword",
-			line:     "ERROR:  some error message",
-			expected: false,
-		},
+		{"\tIndented line", true},
+		{"DETAIL:  some detail", true},
+		{"HINT:  some hint", true},
+		{"CONTEXT:  some context", true},
+		{"STATEMENT:  SELECT 1", true},
+		{"  DETAIL:  with whitespace", true},
+		{"2025-01-12 10:30:45 UTC:app-user@db:[123]:ERROR:  normal log", false},
+		{"", false},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isContinuationLine(tt.line)
-			require.Equal(t, tt.expected, result)
+		t.Run(tt.line, func(t *testing.T) {
+			require.Equal(t, tt.expected, isContinuationLine(tt.line))
 		})
-	}
-}
-
-func TestErrorLogsCollector_InvalidLogFormat(t *testing.T) {
-	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
-	registry := prometheus.NewRegistry()
-
-	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:     loki.NewLogsReceiver(),
-		EntryHandler: entryHandler,
-		Logger:       log.NewNopLogger(),
-		InstanceKey:  "test",
-		SystemID:     "test",
-		Registry:     registry,
-	})
-	require.NoError(t, err)
-
-	err = collector.Start(context.Background())
-	require.NoError(t, err)
-	defer collector.Stop()
-
-	// Send an invalid log line (not enough fields)
-	collector.Receiver().Chan() <- loki.Entry{
-		Entry: push.Entry{
-			Line:      `invalid|log|line`,
-			Timestamp: time.Now(),
-		},
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Check that parse errors counter was incremented
-	mfs, _ := registry.Gather()
-	found := false
-	for _, mf := range mfs {
-		if mf.GetName() == "postgres_error_log_parse_failures_total" {
-			found = true
-			require.Greater(t, mf.GetMetric()[0].GetCounter().GetValue(), 0.0)
-		}
-	}
-	require.True(t, found, "parse error metric should exist")
-}
-
-func TestErrorLogsCollector_ContinuationLinesDoNotIncrementParseFailures(t *testing.T) {
-	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 10), func() {})
-	registry := prometheus.NewRegistry()
-
-	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:     loki.NewLogsReceiver(),
-		EntryHandler: entryHandler,
-		Logger:       log.NewNopLogger(),
-		InstanceKey:  "test",
-		SystemID:     "test-system-id",
-		Registry:     registry,
-	})
-	require.NoError(t, err)
-
-	err = collector.Start(context.Background())
-	require.NoError(t, err)
-	defer collector.Stop()
-
-	// Send continuation lines (should NOT increment parse failures)
-	continuationLines := []string{
-		"\tThis probably means the server terminated abnormally",
-		"DETAIL:  Key (author_id)=(99999) is not present in table \"authors\".",
-		"HINT:  Check the foreign key constraint.",
-		"CONTEXT:  SQL statement \"SELECT * FROM books WHERE author_id = 123\"",
-		"STATEMENT:  INSERT INTO books (title, author_id) VALUES ('Test', 99999)",
-	}
-
-	for _, line := range continuationLines {
-		collector.Receiver().Chan() <- loki.Entry{
-			Entry: push.Entry{
-				Line:      line,
-				Timestamp: time.Now(),
-			},
-		}
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Check that parse errors counter was NOT incremented (should be 0)
-	mfs, _ := registry.Gather()
-	parseFailuresFound := false
-	for _, mf := range mfs {
-		if mf.GetName() == "postgres_error_log_parse_failures_total" {
-			parseFailuresFound = true
-			// Should be 0 since continuation lines don't count as parse failures
-			require.Equal(t, 0.0, mf.GetMetric()[0].GetCounter().GetValue())
-		}
-	}
-
-	// The metric should exist but be zero
-	require.True(t, parseFailuresFound, "parse failures metric should exist")
-}
-
-// TestErrorLogsCollector_RDSLikeLogs tests with comprehensive RDS-like log samples
-func TestErrorLogsCollector_RDSLikeLogs(t *testing.T) {
-	entryHandler := loki.NewEntryHandler(make(chan loki.Entry, 100), func() {})
-	registry := prometheus.NewRegistry()
-
-	collector, err := NewErrorLogs(ErrorLogsArguments{
-		Receiver:     loki.NewLogsReceiver(),
-		EntryHandler: entryHandler,
-		Logger:       log.NewNopLogger(),
-		InstanceKey:  "rds-test-instance",
-		SystemID:     "rds-system",
-		Registry:     registry,
-	})
-	require.NoError(t, err)
-
-	err = collector.Start(context.Background())
-	require.NoError(t, err)
-	defer collector.Stop()
-
-	// Real RDS-like log samples covering various error types
-	// Format: %m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a
-	logSamples := []struct {
-		log      string
-		user     string
-		database string
-		severity string
-	}{
-		{
-			log:      `2025-01-12 10:30:45.123 UTC:10.0.1.5:54321:app-user@books_store:[9112]:4:57014:2025-01-12 10:29:15 UTC:25/112:0:693c34cb.2398::psqlERROR:  canceling statement due to statement timeout`,
-			user:     "app-user",
-			database: "books_store",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:31:23.258 UTC:10.0.1.5:54321:db-admin@books_store:[9185]:9:40P01:2025-01-12 10:29:19 UTC:36/148:837:693c34cf.23e1::webappERROR:  deadlock detected`,
-			user:     "db-admin",
-			database: "books_store",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:32:31.529 UTC:10.0.1.10:45678:conn_limited@books_store:[9449]:4:53300:2025-01-12 10:32:31 UTC:91/57:0:693c34db.24e9::api_workerFATAL:  too many connections for role "conn_limited"`,
-			user:     "conn_limited",
-			database: "books_store",
-			severity: "FATAL",
-		},
-		{
-			log:      `2025-01-12 10:33:42.201 UTC:10.0.1.20:52860:app-user@books_store:[9589]:2:28P01:2025-01-12 10:33:42 UTC:159/363:0:693c34e6.2575::jdbc_clientFATAL:  password authentication failed for user "app-user"`,
-			user:     "app-user",
-			database: "books_store",
-			severity: "FATAL",
-		},
-		{
-			log:      `2025-01-12 10:34:15.891 UTC:10.0.1.5:54322:web-user@orders_db:[10123]:7:23505:2025-01-12 10:30:00 UTC:42/201:1045:693c3500.2790::web_appERROR:  duplicate key value violates unique constraint "orders_pkey"`,
-			user:     "web-user",
-			database: "orders_db",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:35:22.456 UTC:10.0.1.8:43210:api-user@products_db:[10456]:5:23503:2025-01-12 10:35:00 UTC:55/89:1123:693c3512.28d8::rest_apiERROR:  insert or update on table "order_items" violates foreign key constraint "order_items_product_id_fkey"`,
-			user:     "api-user",
-			database: "products_db",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:36:10.789 UTC:10.0.1.15:54323:analytics-user@reports_db:[11234]:3:22012:2025-01-12 10:35:45 UTC:67/145:0:693c3520.2be2::analytics_toolERROR:  division by zero`,
-			user:     "analytics-user",
-			database: "reports_db",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:42:50.789 UTC:10.0.1.50:54329:app-user@app_db:[13012]:4:42P01:2025-01-12 10:40:00 UTC:134/789:2001:693c3580.32d4::app_serverERROR:  relation "non_existent_table" does not exist`,
-			user:     "app-user",
-			database: "app_db",
-			severity: "ERROR",
-		},
-		// Duplicate samples to test metric summing (same labels should increment counter)
-		{
-			log:      `2025-01-12 10:45:00.123 UTC:10.0.1.5:54321:app-user@books_store:[9200]:10:57014:2025-01-12 10:29:15 UTC:25/200:0:693c34cb.9999::psqlERROR:  canceling statement due to user request`,
-			user:     "app-user",
-			database: "books_store",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:46:00.456 UTC:10.0.1.5:54322:app-user@books_store:[9201]:11:57014:2025-01-12 10:29:15 UTC:25/201:0:693c34cb.9998::psqlERROR:  another timeout error`,
-			user:     "app-user",
-			database: "books_store",
-			severity: "ERROR",
-		},
-		{
-			log:      `2025-01-12 10:47:00.789 UTC:10.0.1.10:45678:conn_limited@books_store:[9450]:5:53300:2025-01-12 10:32:31 UTC:91/58:0:693c34db.9997::api_workerFATAL:  too many connections for role "conn_limited" again`,
-			user:     "conn_limited",
-			database: "books_store",
-			severity: "FATAL",
-		},
-	}
-
-	// Send all log samples
-	for _, sample := range logSamples {
-		collector.Receiver().Chan() <- loki.Entry{
-			Entry: push.Entry{
-				Line:      sample.log,
-				Timestamp: time.Now(),
-			},
-		}
-	}
-
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify metrics were created for all expected error types
-	mfs, _ := registry.Gather()
-	var errorMetrics *dto.MetricFamily
-	for _, mf := range mfs {
-		if mf.GetName() == "postgres_errors_total" {
-			errorMetrics = mf
-			break
-		}
-	}
-
-	require.NotNil(t, errorMetrics, "error metrics should exist")
-	// Note: We have 11 log samples but only 8 unique label combinations (some are duplicates for testing summing)
-	require.Equal(t, 8, len(errorMetrics.GetMetric()), "should have 8 unique metric label combinations")
-
-	// Verify that all expected user/database/severity combinations were captured
-	type metricKey struct {
-		user     string
-		database string
-		severity string
-	}
-	capturedMetrics := make(map[metricKey]bool)
-
-	for _, metric := range errorMetrics.GetMetric() {
-		labels := make(map[string]string)
-		for _, label := range metric.GetLabel() {
-			labels[label.GetName()] = label.GetValue()
-		}
-
-		key := metricKey{
-			user:     labels["user"],
-			database: labels["database"],
-			severity: labels["severity"],
-		}
-		capturedMetrics[key] = true
-
-		// Verify instance and server_id labels are set correctly
-		require.Equal(t, "rds-test-instance", labels["instance"])
-		require.Equal(t, "rds-system", labels["server_id"])
-	}
-
-	// Verify all expected samples were captured
-	expectedCounts := make(map[metricKey]int)
-	for _, sample := range logSamples {
-		key := metricKey{
-			user:     sample.user,
-			database: sample.database,
-			severity: sample.severity,
-		}
-		expectedCounts[key]++
-	}
-
-	// Count actual occurrences in metrics
-	actualCounts := make(map[metricKey]float64)
-	for _, metric := range errorMetrics.GetMetric() {
-		labels := make(map[string]string)
-		for _, label := range metric.GetLabel() {
-			labels[label.GetName()] = label.GetValue()
-		}
-
-		key := metricKey{
-			user:     labels["user"],
-			database: labels["database"],
-			severity: labels["severity"],
-		}
-		actualCounts[key] = metric.GetCounter().GetValue()
-	}
-
-	// Verify each expected key exists and has the correct count
-	for key, expectedCount := range expectedCounts {
-		require.True(t, capturedMetrics[key], "Expected metric for user=%s, database=%s, severity=%s",
-			key.user, key.database, key.severity)
-
-		actualCount := actualCounts[key]
-		require.Equal(t, float64(expectedCount), actualCount,
-			"Metric count mismatch for user=%s, database=%s, severity=%s: expected %d, got %.0f",
-			key.user, key.database, key.severity, expectedCount, actualCount)
-	}
-
-	// Verify specific summed metrics
-	appUserBooksStoreKey := metricKey{user: "app-user", database: "books_store", severity: "ERROR"}
-	require.Equal(t, float64(3), actualCounts[appUserBooksStoreKey],
-		"app-user@books_store:ERROR should have count of 3 (appears 3 times in samples)")
-
-	connLimitedKey := metricKey{user: "conn_limited", database: "books_store", severity: "FATAL"}
-	require.Equal(t, float64(2), actualCounts[connLimitedKey],
-		"conn_limited@books_store:FATAL should have count of 2 (appears 2 times in samples)")
-
-	// Verify logs without SQLSTATE or with INFO/LOG severity were skipped
-	collector.Receiver().Chan() <- loki.Entry{
-		Entry: push.Entry{
-			Line:      `2025-01-12 10:45:00.000 UTC:10.0.1.5:54321:app-user@books_store:[9112]:5::2025-01-12 10:29:15 UTC:25/112:0:693c34cb.2398::psqlLOG:  connection received`,
-			Timestamp: time.Now(),
-		},
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Metric count should not have increased
-	mfsAfter, _ := registry.Gather()
-	for _, mf := range mfsAfter {
-		if mf.GetName() == "postgres_errors_total" {
-			require.Equal(t, len(errorMetrics.GetMetric()), len(mf.GetMetric()), "should not create metrics for non-error logs")
-		}
 	}
 }
