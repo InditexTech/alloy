@@ -99,11 +99,11 @@ replaces:
 
   - comment: Replace OpenTelemetry OBI with Grafana fork
     dependency: go.opentelemetry.io/obi
-    replacement: github.com/grafana/opentelemetry-ebpf-instrumentation v1.3.13
+    replacement: github.com/grafana/opentelemetry-ebpf-instrumentation v1.4.11
 
   - comment: Replace OpenTelemetry eBPF profiler with Grafana fork
     dependency: go.opentelemetry.io/ebpf-profiler
-    replacement: github.com/grafana/opentelemetry-ebpf-profiler v0.0.202550-0.20251216083346-f910fc4db23e
+    replacement: github.com/grafana/opentelemetry-ebpf-profiler v0.0.202602-0.20260123050037-c33a6e86a2f5
 
   - comment: Update openshift/client-go to version compatible with structured-merge-diff v6
     dependency: github.com/openshift/client-go
@@ -124,7 +124,7 @@ replaces:
     replacement: sigs.k8s.io/controller-runtime v0.20.4
 
   - comment: >
-      Point to fork that uses prometheus v0.308.0, changes here are mostly related to type name updates.
-      This can be removed once the upstream dependency points to prometheus v0.308.0 and above
-    dependency: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter
-    replacement: github.com/grafana/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter v0.0.0-20260108134526-9817e6c361c9
+      Fork to grafana repo to address issue with freebsd build tags.
+      This can be removed once https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/42645 is fixed
+    dependency: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filestatsreceiver
+    replacement: github.com/grafana/opentelemetry-collector-contrib/receiver/filestatsreceiver v0.0.0-20260126095124-0af81a9e8966
