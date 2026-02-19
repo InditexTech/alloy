@@ -2,14 +2,32 @@ package java
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/grafana/alloy/internal/component/discovery"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 const (
 	labelServiceName    = "service_name"
 	labelServiceNameK8s = "__meta_kubernetes_pod_annotation_pyroscope_io_service_name"
+	labelSessionID      = "__session_id__"
 )
+
+func buildLabels(target discovery.Target) labels.Labels {
+	ls := labels.NewBuilder(labels.EmptyLabels())
+	for k, v := range target.AsMap() {
+		if strings.HasPrefix(k, model.ReservedLabelPrefix) && k != labelSessionID {
+			continue
+		}
+		ls.Set(k, v)
+	}
+	if ls.Get(labelServiceName) == "" {
+		ls.Set(labelServiceName, inferServiceName(target))
+	}
+	return ls.Labels()
+}
 
 func inferServiceName(target discovery.Target) string {
 	if k8sServiceName, ok := target.Get(labelServiceNameK8s); ok {

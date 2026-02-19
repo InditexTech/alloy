@@ -13,9 +13,6 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	jfrpprof "github.com/grafana/jfr-parser/pprof"
-	jfrpprofPyroscope "github.com/grafana/jfr-parser/pprof/pyroscope"
-	"github.com/prometheus/prometheus/model/labels"
 	gopsutil "github.com/shirou/gopsutil/v3/process"
 
 	"github.com/grafana/alloy/internal/component/discovery"
@@ -40,12 +37,11 @@ type profilingLoop struct {
 	profiler   Profiler
 	sampleRate int
 
-	error            error
-	lastError        time.Time
-	lastPush         time.Time
-	lastBytesPerType []debugInfoBytesPerType
-	totalBytes       int64
-	totalSamples     int64
+	error      error
+	lastError  time.Time
+	lastPush   time.Time
+	lastBytes  int64
+	totalBytes int64
 }
 
 type Profiler interface {
@@ -160,59 +156,38 @@ func (p *profilingLoop) reset() error {
 
 	return p.push(jfrBytes, startTime, endTime, int64(sampleRate))
 }
+
 func (p *profilingLoop) push(jfrBytes []byte, startTime time.Time, endTime time.Time, sampleRate int64) error {
-	profiles, err := jfrpprof.ParseJFR(jfrBytes, &jfrpprof.ParseInput{
-		StartTime:  startTime,
-		EndTime:    endTime,
-		SampleRate: sampleRate,
-	}, new(jfrpprof.LabelsSnapshot))
-	if err != nil {
-		return fmt.Errorf("failed to parse jfr: %w", err)
-	}
 	target := p.getTarget()
-	var totalSamples, totalBytes int64
+	totalBytes := int64(len(jfrBytes))
 
-	// reset the per type bytes stats
-	p.lastBytesPerType = p.lastBytesPerType[:0]
+	ls := buildLabels(target)
 
-	for _, req := range profiles.Profiles {
-		metric := req.Metric
-		sz := req.Profile.SizeVT()
-		l := log.With(p.logger, "metric", metric, "sz", sz)
-		ls := labels.NewBuilder(labels.EmptyLabels())
-		for _, l := range jfrpprofPyroscope.Labels(target.AsMap(), profiles.JFREvent, req.Metric, "", spyName) {
-			ls.Set(l.Name, l.Value)
-		}
-		if ls.Get(labelServiceName) == "" {
-			ls.Set(labelServiceName, inferServiceName(target))
-		}
-
-		p.lastBytesPerType = append(p.lastBytesPerType, debugInfoBytesPerType{
-			Type:  metric,
-			Bytes: int64(sz),
-		})
-		totalBytes += int64(sz)
-		totalSamples += int64(len(req.Profile.Sample))
-
-		profile, err := req.Profile.MarshalVT()
-		if err != nil {
-			_ = l.Log("msg", "failed to marshal profile", "err", err)
-			continue
-		}
-		samples := []*pyroscope.RawSample{{RawProfile: profile}}
-		err = p.output.Appender().Append(context.Background(), ls.Labels(), samples)
-		if err != nil {
-			_ = l.Log("msg", "failed to push jfr", "err", err)
-			continue
-		}
-		_ = l.Log("msg", "pushed jfr-pprof")
-
-		p.mutex.Lock()
-		p.lastPush = time.Now()
-		p.totalSamples += totalSamples
-		p.totalBytes += totalBytes
-		p.mutex.Unlock()
+	profile, err := buildJFRIngestProfile(jfrBytes, ls, JFRIngestOptions{
+		StartTime:   startTime,
+		EndTime:     endTime,
+		SampleRate:  sampleRate,
+		SpyName:     spyName,
+		Units:       "samples",
+		Aggregation: "sum",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to build JFR ingest profile: %w", err)
 	}
+
+	err = p.output.Appender().AppendIngest(context.Background(), profile)
+	if err != nil {
+		_ = level.Error(p.logger).Log("msg", "failed to push raw jfr", "err", err, "sz", totalBytes)
+		return fmt.Errorf("failed to push raw jfr: %w", err)
+	}
+	_ = level.Debug(p.logger).Log("msg", "pushed raw jfr", "sz", totalBytes)
+
+	p.mutex.Lock()
+	p.lastPush = time.Now()
+	p.totalBytes += totalBytes
+	p.lastBytes = totalBytes
+	p.mutex.Unlock()
+
 	return nil
 }
 
@@ -314,19 +289,11 @@ func (p *profilingLoop) debugInfo() *debugInfoProfiledTarget {
 
 	d := &debugInfoProfiledTarget{
 		TotalBytes:   p.totalBytes,
-		TotalSamples: p.totalSamples,
+		LastBytes:    p.lastBytes,
 		LastProfiled: p.lastPush,
 		LastError:    p.lastError,
 		PID:          p.pid,
 		Target:       p.target,
-	}
-
-	// expose per profile type bytes
-	if len(p.lastBytesPerType) > 0 {
-		d.LastProfileBytesPerType = make(map[string]int64)
-		for _, b := range p.lastBytesPerType {
-			d.LastProfileBytesPerType[b.Type] += b.Bytes
-		}
 	}
 
 	// expose error message if given
